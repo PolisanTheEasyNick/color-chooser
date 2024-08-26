@@ -1,8 +1,12 @@
 package dev.polisan.colorchooser.presentation
 
 import androidx.compose.ui.graphics.Color
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
 import java.nio.ByteBuffer
@@ -19,41 +23,52 @@ fun hmacSha256(secret: String, data: ByteArray): ByteArray {
     return mac.doFinal(data)
 }
 
-fun sendTcpPacket(host: String, port: Int, data: ByteArray) {
-    // Create a socket connection to the specified host and port
+suspend fun sendTcpPacket(host: String, port: Int, data: ByteArray, toWait: Boolean = false): ByteArray? {
     val socket = Socket(host, port)
-    // Get the output stream of the socket
     val outputStream: OutputStream = socket.getOutputStream()
+    val inputStream: InputStream = BufferedInputStream(socket.getInputStream())
 
-    try {
-        // Send the byte array through the output stream
+    return try {
         outputStream.write(data)
         outputStream.flush()
         println("Data sent to $host:$port")
+        if(toWait) {
+            val response = inputStream.readBytes()
+            return response
+        }
+        null
     } catch (e: Exception) {
         e.printStackTrace()
+        null
     } finally {
-        // Close the output stream and the socket
         outputStream.close()
+        inputStream.close()
         socket.close()
     }
 }
-
-fun sendColor(color: Color) {
-    //using RGB protocol ver 1.0
+fun generateHeader(isRequestColor: Boolean = false): ByteArray {
     val currentTimeStamp = System.currentTimeMillis() / 1000
     println("Current time: $currentTimeStamp")
 
     val nonce = Random.nextLong().toULong()
-    println("Red value in color: ${color.red * 255}")
-    println("color hex: ${color.toHexCode()}")
 
     val timestampBytes = ByteBuffer.allocate(8).putLong(currentTimeStamp).array()
     val nonceBytes = ByteBuffer.allocate(8).putLong(nonce.toLong()).array()
+    var hexString = nonceBytes.joinToString(" ") { String.format("%02X", it) }
+    println("Nonce: $hexString")
 
-    val version = 1.toByte()
+    val version = if (isRequestColor) 3.toByte() else 1.toByte();
 
-    val HEADER = timestampBytes + nonceBytes + byteArrayOf(version)
+    var HEADER = timestampBytes + nonceBytes + byteArrayOf(version)
+    if(isRequestColor) HEADER += byteArrayOf(1.toByte())
+    return HEADER
+}
+
+fun sendColor(color: Color) {
+    //using RGB protocol ver 1.0
+    val HEADER = generateHeader()
+    println("Red value in color: ${color.red * 255}")
+    println("color hex: ${color.toHexCode()}")
 
     val red = (color.red * 255).toInt()
     val green = (color.green * 255).toInt()
@@ -64,15 +79,34 @@ fun sendColor(color: Color) {
 
     var hexString = headerWithPayload.joinToString(" ") { String.format("%02X", it) }
     println("HEADER with PAYLOAD: $hexString")
-    val secret = "SHARED_KEY"
+    val secret = "SHARED_SECRET"
     val hmacResult = hmacSha256(secret, headerWithPayload)
-    hexString = hmacResult.joinToString("") { String.format("%02X", it) }
+    hexString = hmacResult.joinToString(" ") { String.format("%02X", it) }
     println("HMAC-SHA256: $hexString")
 
     val tcpPackage = HEADER + hmacResult + PAYLOAD
     GlobalScope.launch {
-        sendTcpPacket("192.168.0.5", 3384, tcpPackage)
+        sendTcpPacket("192.168.0.4", 3384, tcpPackage)
     }
-
 }
 
+suspend fun receiveColor(): ByteArray? {
+    val HEADER = generateHeader(true)
+    var hexString = HEADER.joinToString(" ") { String.format("%02X", it) }
+    println("HEADER: $hexString")
+    val secret = "SHARED_SECRET"
+    val hmacResult = hmacSha256(secret, HEADER)
+    hexString = hmacResult.joinToString(" ") { String.format("%02X", it) }
+    println("HMAC-SHA256: $hexString")
+
+    val tcpPackage = HEADER + hmacResult
+    return withContext(Dispatchers.IO) {
+        try {
+            var colors = sendTcpPacket("192.168.0.4", 3384, tcpPackage, true)
+            colors
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+}
